@@ -19,6 +19,18 @@ from yolox.utils import xyxy2cxcywh
 
 
 def augment_hsv(img, hgain=5, sgain=30, vgain=30):
+    # HSV jitter assumes an 8-bit-range BGR image (clip bounds below are
+    # 0-255) and is meaningless anyway on a single-band image replicated
+    # into 3 identical channels (saturation is always 0, so hue is
+    # undefined). Guard against silently corrupting a normalized float
+    # image if this ever gets called with hsv_prob > 0 by mistake -- for
+    # FITS-derived data, set `hsv_prob=0` in the Exp instead of relying on
+    # this function to handle it.
+    if np.issubdtype(img.dtype, np.floating):
+        raise ValueError(
+            "augment_hsv() does not support floating-point/normalized images "
+            "(e.g. FITS-derived data). Set hsv_prob=0 in your Exp file."
+        )
     hsv_augs = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain]  # random gains
     hsv_augs *= np.random.randint(0, 2, 3)  # random selection of h, s, v
     hsv_augs = hsv_augs.astype(np.int16)
@@ -122,7 +134,8 @@ def random_affine(
 ):
     M, scale = get_affine_matrix(target_size, degrees, translate, scales, shear)
 
-    img = cv2.warpAffine(img, M, dsize=target_size, borderValue=(114, 114, 114))
+    border_value = 0.0 if np.issubdtype(img.dtype, np.floating) else (114, 114, 114)
+    img = cv2.warpAffine(img, M, dsize=target_size, borderValue=border_value)
 
     # Transform label coordinates
     if len(targets) > 0:
@@ -140,17 +153,26 @@ def _mirror(image, boxes, prob=0.5):
 
 
 def preproc(img, input_size, swap=(2, 0, 1)):
+    # Normalized float32 images (e.g. from FITS) keep their dtype and use a
+    # 0.0 (true black/empty) pad value instead of the 114 mid-gray constant,
+    # which is only meaningful for 0-255 uint8 imagery.
+    is_float = np.issubdtype(img.dtype, np.floating)
+    pad_dtype = img.dtype if is_float else np.uint8
+    pad_value = 0.0 if is_float else 114
+
     if len(img.shape) == 3:
-        padded_img = np.ones((input_size[0], input_size[1], 3), dtype=np.uint8) * 114
+        padded_img = np.full((input_size[0], input_size[1], 3), pad_value, dtype=pad_dtype)
     else:
-        padded_img = np.ones(input_size, dtype=np.uint8) * 114
+        padded_img = np.full(input_size, pad_value, dtype=pad_dtype)
 
     r = min(input_size[0] / img.shape[0], input_size[1] / img.shape[1])
     resized_img = cv2.resize(
         img,
         (int(img.shape[1] * r), int(img.shape[0] * r)),
         interpolation=cv2.INTER_LINEAR,
-    ).astype(np.uint8)
+    )
+    if not is_float:
+        resized_img = resized_img.astype(np.uint8)
     padded_img[: int(img.shape[0] * r), : int(img.shape[1] * r)] = resized_img
 
     padded_img = padded_img.transpose(swap)

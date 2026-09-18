@@ -16,3 +16,8 @@ tensorboard
 pycocotools>=2.0.2
 onnx>=1.13.0
 onnx-simplifier==0.4.10
+
+# added for SatSim-derived training data: reads 16-bit FITS images directly
+# (yolox/data/datasets/coco.py::_load_fits_image) instead of lowering
+# precision to 8-bit via cv2.imread
+astropy

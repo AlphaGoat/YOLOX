@@ -99,7 +99,9 @@ class MosaicDetection(Dataset):
                 # generate output mosaic image
                 (h, w, c) = img.shape[:3]
                 if i_mosaic == 0:
-                    mosaic_img = np.full((input_h * 2, input_w * 2, c), 114, dtype=np.uint8)
+                    is_float = np.issubdtype(img.dtype, np.floating)
+                    fill = 0.0 if is_float else 114
+                    mosaic_img = np.full((input_h * 2, input_w * 2, c), fill, dtype=img.dtype)
 
                 # suffix l means large image, while s means small image in mosaic aug.
                 (l_x1, l_y1, l_x2, l_y2), (s_x1, s_y1, s_x2, s_y2) = get_mosaic_coordinate(
@@ -160,6 +162,7 @@ class MosaicDetection(Dataset):
             return img, label, img_info, img_id
 
     def mixup(self, origin_img, origin_labels, input_dim):
+        orig_dtype = origin_img.dtype
         jit_factor = random.uniform(*self.mixup_scale)
         FLIP = random.uniform(0, 1) > 0.5
         cp_labels = []
@@ -168,10 +171,12 @@ class MosaicDetection(Dataset):
             cp_labels = self._dataset.load_anno(cp_index)
         img, cp_labels, _, _ = self._dataset.pull_item(cp_index)
 
+        is_float = np.issubdtype(img.dtype, np.floating)
+        fill = 0.0 if is_float else 114
         if len(img.shape) == 3:
-            cp_img = np.ones((input_dim[0], input_dim[1], 3), dtype=np.uint8) * 114
+            cp_img = np.full((input_dim[0], input_dim[1], 3), fill, dtype=img.dtype)
         else:
-            cp_img = np.ones(input_dim, dtype=np.uint8) * 114
+            cp_img = np.full(input_dim, fill, dtype=img.dtype)
 
         cp_scale_ratio = min(input_dim[0] / img.shape[0], input_dim[1] / img.shape[1])
         resized_img = cv2.resize(
@@ -196,7 +201,7 @@ class MosaicDetection(Dataset):
         origin_h, origin_w = cp_img.shape[:2]
         target_h, target_w = origin_img.shape[:2]
         padded_img = np.zeros(
-            (max(origin_h, target_h), max(origin_w, target_w), 3), dtype=np.uint8
+            (max(origin_h, target_h), max(origin_w, target_w), 3), dtype=cp_img.dtype
         )
         padded_img[:origin_h, :origin_w] = cp_img
 
@@ -231,4 +236,7 @@ class MosaicDetection(Dataset):
         origin_img = origin_img.astype(np.float32)
         origin_img = 0.5 * origin_img + 0.5 * padded_cropped_img.astype(np.float32)
 
-        return origin_img.astype(np.uint8), origin_labels
+        # Preserve the pre-blend dtype: uint8 datasets round-trip through
+        # float32 back to uint8 (original behavior), while normalized
+        # float32 (e.g. FITS-derived) data stays float32, losing no precision.
+        return origin_img.astype(orig_dtype), origin_labels

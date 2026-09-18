@@ -137,7 +137,11 @@ class COCODataset(CacheDataset):
             img,
             (int(img.shape[1] * r), int(img.shape[0] * r)),
             interpolation=cv2.INTER_LINEAR,
-        ).astype(np.uint8)
+        )
+        # NOTE: no forced uint8 cast here (upstream YOLOX did `.astype(np.uint8)`
+        # unconditionally). cv2.resize already preserves the input dtype
+        # (uint8 stays uint8, float32 stays float32), so a float32/16-bit-derived
+        # image keeps its precision through resizing.
         return resized_img
 
     def load_image(self, index):
@@ -145,9 +149,50 @@ class COCODataset(CacheDataset):
 
         img_file = os.path.join(self.data_dir, self.name, file_name)
 
-        img = cv2.imread(img_file)
-        assert img is not None, f"file named {img_file} not found"
+        if file_name.lower().endswith((".fits", ".fit", ".fts")):
+            img = self._load_fits_image(img_file)
+        else:
+            img = cv2.imread(img_file)
+            assert img is not None, f"file named {img_file} not found"
 
+        return img
+
+    def _load_fits_image(self, img_file):
+        """Loads a FITS image without lowering it to 8-bit.
+
+        SatSim writes calibrated sensor data as uint16 FITS. This reads it,
+        normalizes to float32 in [0, 1] (dividing by 65535, the full uint16
+        range), and replicates the single band to 3 identical channels so it
+        satisfies the model's `Focus(3, ...)` stem without any model changes
+        or precision loss.
+
+        NOTE: FITS has no native unsigned-16-bit BITPIX; unsigned data is
+        stored as signed int16 (BITPIX=16) plus a `BZERO=32768` header
+        offset (the standard FITS convention). Astropy's *default* scaling
+        (do NOT pass `do_not_scale_image_data=True`) applies that offset and
+        hands back the correct uint16 array; disabling it returns the raw
+        offset int16 storage instead, which produced negative/garbage
+        values here until this was corrected.
+
+        NOTE: SatSim's `fits_compression` setting (e.g. "rice") stores the
+        actual pixel data in a `CompImageHDU` *extension*, not the primary
+        HDU -- the primary HDU (index 0) is header-only with `data is None`
+        in that case. Search HDUs in order and use the first one that
+        actually has data, rather than assuming index 0.
+        """
+        from astropy.io import fits
+
+        with fits.open(img_file) as hdul:
+            data = None
+            for hdu in hdul:
+                if hdu.data is not None:
+                    data = hdu.data
+                    break
+
+        assert data is not None, f"file named {img_file} not found"
+
+        img = (data.astype(np.float32) / 65535.0)
+        img = np.stack([img, img, img], axis=-1)
         return img
 
     @cache_read_img(use_cache=True)

@@ -5,7 +5,40 @@
 import cv2
 import numpy as np
 
-__all__ = ["vis"]
+__all__ = ["vis", "stretch_for_display"]
+
+
+def stretch_for_display(img, lo_pct=1.0, hi_pct=99.5):
+    """Percentile-clip + linear-stretch a float image to uint8 [0, 255] for
+    human-viewable logging (e.g. TensorBoard/wandb image panels).
+
+    SatSim-derived training images are decoded from 16-bit FITS and kept as
+    normalized float32 in [0, 1] throughout the pipeline (see
+    yolox/data/datasets/coco.py::_load_fits_image) to preserve full sensor
+    precision for training. Real background+point-source frames only use a
+    small slice of that [0, 1] range (a typical frame's max pixel is well
+    under 1.0), so casting straight to uint8 for display looks near-black.
+    This is a *display-only* transform -- never use it on data headed into
+    the model or loss, only on a copy being rendered/logged for a human.
+
+    Args:
+        img: `np.ndarray`, float image, any value range, any number of
+            channels (percentiles are computed across the whole array, so a
+            3-channel image with identical replicated channels -- our FITS
+            loader's convention -- stretches consistently across channels).
+        lo_pct: `float`, lower percentile clipped to black.
+        hi_pct: `float`, upper percentile clipped to white.
+
+    Returns:
+        `np.ndarray`, uint8, same shape as `img`.
+    """
+    img = np.asarray(img, dtype=np.float32)
+    lo, hi = np.percentile(img, [lo_pct, hi_pct])
+    if hi <= lo:
+        # Degenerate (flat) image -- avoid a divide-by-zero.
+        return np.zeros_like(img, dtype=np.uint8)
+    stretched = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+    return (stretched * 255).astype(np.uint8)
 
 
 def vis(img, boxes, scores, cls_ids, conf=0.5, class_names=None):

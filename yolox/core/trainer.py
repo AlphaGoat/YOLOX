@@ -6,11 +6,17 @@ import os
 import time
 from loguru import logger
 
+import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from yolox.data import DataPrefetcher
+from yolox.evaluators.pr_metrics import (
+    compute_pr_curve,
+    log_pr_curve_to_tensorboard,
+    precision_recall_at_threshold,
+)
 from yolox.exp import Exp
 from yolox.utils import (
     MeterBuffer,
@@ -30,7 +36,9 @@ from yolox.utils import (
     occupy_mem,
     save_checkpoint,
     setup_logger,
-    synchronize
+    stretch_for_display,
+    synchronize,
+    vis,
 )
 
 
@@ -285,6 +293,7 @@ class Trainer:
                     for k, v in loss_meter.items():
                         self.tblogger.add_scalar(
                             f"train/{k}", v.latest, self.progress_in_iter)
+                    self.log_weight_stats()
                 if self.args.logger == "wandb":
                     metrics = {"train/" + k: v.latest for k, v in loss_meter.items()}
                     metrics.update({
@@ -303,6 +312,60 @@ class Trainer:
             self.input_size = self.exp.random_resize(
                 self.train_loader, self.epoch, self.rank, self.is_distributed
             )
+
+    def log_weight_stats(self):
+        """Logs aggregate parameter and gradient statistics (mean, std, L2
+        grad norm), pooled across every trainable parameter, to TensorBoard
+        -- called every `print_interval` iterations (same cadence as the
+        loss/lr scalars just above this call), so a loss spike or NaN can
+        be correlated against weight/gradient behavior on the same
+        iteration axis. Useful for spotting training instability
+        (gradient explosion/vanishing, runaway weight growth) at a glance;
+        `log_weight_histograms` (called once per epoch from
+        `evaluate_and_save_model`) gives the heavier per-layer detail to
+        diagnose *which* layer if this aggregate view looks off.
+
+        Called from `after_iter()`, i.e. after `train_one_iter()` (backward
+        + optimizer step) has fully completed for this iteration -- under
+        AMP (`--fp16`), `GradScaler.step()` unscales gradients in place
+        before applying (or skipping, on an inf/nan step) the optimizer
+        step, so `.grad` already holds real, comparable-across-iterations
+        values here with no extra unscaling needed. Gradients aren't
+        cleared until the *next* iteration's `zero_grad()`, so they're
+        still live at this point.
+        """
+        model = self.model.module if is_parallel(self.model) else self.model
+
+        try:
+            weight_vals = []
+            grad_vals = []
+            grad_sq_sum = 0.0
+            for p in model.parameters():
+                if not p.requires_grad:
+                    continue
+                weight_vals.append(p.detach().reshape(-1).float())
+                if p.grad is not None:
+                    g = p.grad.detach().reshape(-1).float()
+                    grad_vals.append(g)
+                    grad_sq_sum += g.pow(2).sum().item()
+
+            if weight_vals:
+                w = torch.cat(weight_vals)
+                self.tblogger.add_scalar("train/weights/mean", w.mean().item(), self.progress_in_iter)
+                self.tblogger.add_scalar("train/weights/std", w.std().item(), self.progress_in_iter)
+
+            if grad_vals:
+                g = torch.cat(grad_vals)
+                self.tblogger.add_scalar("train/grad/mean", g.mean().item(), self.progress_in_iter)
+                self.tblogger.add_scalar("train/grad/std", g.std().item(), self.progress_in_iter)
+                self.tblogger.add_scalar("train/grad/norm", grad_sq_sum ** 0.5, self.progress_in_iter)
+        except Exception:
+            # Metrics logging must never take down an actual training run --
+            # and NaN/Inf parameters or gradients (exactly the instability
+            # this is meant to help catch) are the case most likely to
+            # trip an edge case here. logger.opt(exception=True), not
+            # logger.warning(..., exc_info=True) -- see log_weight_histograms.
+            logger.opt(exception=True).warning("log_weight_stats failed, skipping this iteration")
 
     @property
     def progress_in_iter(self):
@@ -363,6 +426,9 @@ class Trainer:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.log_prediction_images(predictions)
+                self.log_precision_recall(predictions)
+                self.log_weight_histograms()
             if self.args.logger == "wandb":
                 self.wandb_logger.log_metrics({
                     "val/COCOAP50": ap50,
@@ -395,6 +461,141 @@ class Trainer:
                 }
             self.mlflow_logger.save_checkpoints(self.args, self.exp, self.file_name, self.epoch,
                                                 metadata, update_best_ckpt)
+
+    def log_prediction_images(self, predictions, max_images=8):
+        """Logs a handful of validation images with predicted boxes drawn in
+        to TensorBoard, for visual sanity-checking during training.
+
+        TensorBoard has no declarative box-overlay format (unlike wandb's
+        `wandb.Image(img, boxes=...)`, used elsewhere in this file), so
+        boxes are drawn directly into the pixel data via `vis()`.
+
+        `predictions` values are in *original* (pre-resize) image pixel
+        space (see COCOEvaluator.convert_to_coco_format: `bboxes /= scale`
+        undoes the resize before storing), so boxes are re-scaled by the
+        same `min(test_size / orig_size)` factor the evaluator used before
+        being drawn onto the resized-but-unpadded image `pull_item` returns
+        -- drawing unscaled original-space boxes onto a resized image would
+        misalign them.
+
+        Images are decoded from 16-bit FITS and kept as normalized float32
+        for training precision (see yolox/data/datasets/coco.py); real
+        frames only use a small slice of that value range, so
+        `stretch_for_display()` (percentile clip + linear stretch) is
+        applied before drawing/logging -- without it, most frames would
+        look almost entirely black.
+        """
+        dataset = self.evaluator.dataloader.dataset
+        test_size = self.exp.test_size
+        class_names = dataset._classes
+
+        ids = dataset.ids[:max_images]
+        if not ids:
+            return
+
+        for img_id in ids:
+            index = dataset.ids.index(img_id)
+            img, _, (orig_h, orig_w), _ = dataset.pull_item(index)
+
+            pred = predictions.get(
+                int(img_id), {"bboxes": [], "scores": [], "categories": []}
+            )
+            scale = min(test_size[0] / orig_h, test_size[1] / orig_w)
+            boxes = np.array(pred["bboxes"], dtype=np.float32).reshape(-1, 4) * scale
+            scores = np.array(pred["scores"], dtype=np.float32)
+            # vis() indexes _classes/_COLORS by the model's internal
+            # contiguous class index, but predictions store the original
+            # COCO category_id (see convert_to_coco_format) -- map back.
+            cls_ids = np.array(
+                [dataset.class_ids.index(c) for c in pred["categories"]], dtype=np.int64
+            )
+
+            disp = stretch_for_display(img)
+            disp = vis(disp.copy(), boxes, scores, cls_ids, conf=0.3, class_names=class_names)
+
+            self.tblogger.add_image(
+                f"val/predictions/{img_id}", disp, self.epoch + 1, dataformats="HWC"
+            )
+
+    def log_precision_recall(self, predictions):
+        """Logs single-class precision/recall to TensorBoard, plus a full
+        PR curve, every eval.
+
+        `COCOEvaluator` only surfaces aggregate COCO AP/AR (val/COCOAP50,
+        val/COCOAP50_95, logged just above this call) -- not precision or
+        recall at a specific confidence threshold, and not a PR curve at
+        all. See yolox/evaluators/pr_metrics.py for why those had to be
+        computed directly (greedy IoU matching) rather than read out of
+        pycocotools' internal COCOeval state.
+
+        `val/precision` and `val/recall` are reported at `self.exp.test_conf`
+        -- the same confidence threshold actually used to filter detections
+        at inference (see COCOEvaluator.evaluate's `postprocess` call), so
+        these answer "what precision/recall does the model get as deployed"
+        rather than an aggregate across all thresholds.
+        """
+        coco_gt = self.evaluator.dataloader.dataset.coco
+        pr_curve = compute_pr_curve(predictions, coco_gt, iou_thresh=0.5)
+
+        precision, recall = precision_recall_at_threshold(pr_curve, self.exp.test_conf)
+        # precision is NaN when nothing scored >= test_conf yet (common
+        # early in training) -- skip the scalar point rather than log a
+        # misleading 0, which would look like "bad model" instead of "no
+        # confident predictions yet". recall is always well-defined (0 in
+        # that case, since the ground-truth count is unaffected).
+        if not np.isnan(precision):
+            self.tblogger.add_scalar("val/precision", precision, self.epoch + 1)
+        self.tblogger.add_scalar("val/recall", recall, self.epoch + 1)
+
+        log_pr_curve_to_tensorboard(self.tblogger, pr_curve, self.epoch + 1)
+
+    def log_weight_histograms(self):
+        """Logs a weight and gradient distribution histogram per named
+        parameter tensor to TensorBoard, once per epoch.
+
+        Heavier than `log_weight_stats`' pooled-aggregate scalars (one
+        histogram per parameter tensor -- ~150-200 for YOLOX-S -- rather
+        than a handful of numbers), so it runs at the coarser per-epoch
+        cadence used by the other eval-time TensorBoard additions here
+        (log_prediction_images, log_precision_recall) instead of every
+        print_interval iterations. This is what answers "which layer" if
+        the pooled aggregate in log_weight_stats looks unstable -- e.g. a
+        single layer's weights or gradients drifting/exploding can be
+        invisible in a global mean/std pooled across every parameter, but
+        is visible as that one tag's histogram spreading out or shifting
+        over epochs.
+
+        Uses whatever `.grad` currently holds, i.e. the last training
+        iteration's gradient this epoch (gradients aren't cleared until
+        the next iteration's zero_grad()) -- a fair per-epoch snapshot for
+        stability monitoring even though it isn't every iteration's
+        gradient the way log_weight_stats' scalars are.
+        """
+        model = self.model.module if is_parallel(self.model) else self.model
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            try:
+                self.tblogger.add_histogram(
+                    f"weights/{name}", p.detach().reshape(-1).float().cpu(), self.epoch + 1
+                )
+                if p.grad is not None:
+                    self.tblogger.add_histogram(
+                        f"grads/{name}", p.grad.detach().reshape(-1).float().cpu(), self.epoch + 1
+                    )
+            except Exception:
+                # As in log_weight_stats: a single degenerate tensor (e.g.
+                # NaN/Inf from real instability -- confirmed to happen in
+                # practice for a fresh, randomly-initialized model: the
+                # single-element head.obj_preds.*.bias gradient can be NaN
+                # early on if a batch assigns zero foreground anchors) must
+                # not take down the rest of the run or the other
+                # parameters' histograms. logger.opt(exception=True), not
+                # logger.warning(..., exc_info=True) -- the latter is the
+                # stdlib `logging` kwarg, not loguru's API; it's silently
+                # accepted but does not attach a traceback.
+                logger.opt(exception=True).warning(f"log_weight_histograms failed for '{name}', skipping")
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
         if self.rank == 0:

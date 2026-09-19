@@ -5,7 +5,7 @@
 import cv2
 import numpy as np
 
-__all__ = ["vis", "stretch_for_display"]
+__all__ = ["vis", "vis_tp_fp", "stretch_for_display"]
 
 
 def stretch_for_display(img, lo_pct=1.0, hi_pct=99.5):
@@ -71,6 +71,69 @@ def vis(img, boxes, scores, cls_ids, conf=0.5, class_names=None):
             -1
         )
         cv2.putText(img, text, (x0, y0 + txt_size[1]), font, 0.4, txt_color, thickness=1)
+
+    return img
+
+
+def _draw_labeled_box(img, box, color, text):
+    x0, y0, x1, y1 = (int(v) for v in box)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    txt_color = (0, 0, 0) if sum(color) > 380 else (255, 255, 255)
+
+    txt_size = cv2.getTextSize(text, font, 0.4, 1)[0]
+    cv2.rectangle(img, (x0, y0), (x1, y1), color, 2)
+
+    txt_bk_color = tuple(int(c * 0.7) for c in color)
+    cv2.rectangle(
+        img,
+        (x0, y0 + 1),
+        (x0 + txt_size[0] + 1, y0 + int(1.5 * txt_size[1])),
+        txt_bk_color,
+        -1
+    )
+    cv2.putText(img, text, (x0, y0 + txt_size[1]), font, 0.4, txt_color, thickness=1)
+
+
+def vis_tp_fp(img, boxes, scores, is_tp, gt_boxes, conf=0.5):
+    """Draws ground-truth boxes plus predicted boxes labeled by whether each
+    prediction is a true or false positive, for visual sanity-checking
+    against `yolox.evaluators.pr_metrics`' greedy IoU matching (the same
+    rule that drives the PR curve, F1, and best-checkpoint selection) --
+    seeing *which* predictions those metrics counted as TP/FP, on the
+    actual image, catches matching-logic surprises a scalar metric alone
+    would hide (e.g. a "correct-looking" box that's actually a duplicate
+    FP because a higher-confidence box already claimed that ground truth).
+
+    Args:
+        img: `np.ndarray`, HWC, uint8. Modified in place and returned.
+        boxes: `np.ndarray` [N, 4], xyxy, predicted boxes, same pixel space
+            as `img`.
+        scores: `np.ndarray` [N], predicted confidence scores, same order
+            as `boxes`.
+        is_tp: `np.ndarray` [N] bool, same order as `boxes` -- e.g. from
+            `yolox.evaluators.pr_metrics.match_predictions`.
+        gt_boxes: `np.ndarray` [M, 4], xyxy, ground-truth boxes, same pixel
+            space as `img`.
+        conf: `float`, only predictions with score >= conf are drawn (does
+            not affect which ground-truth boxes are drawn -- those have no
+            confidence score and are always drawn).
+
+    Returns:
+        `img`, modified in place.
+    """
+    GT_COLOR = (255, 255, 0)
+    TP_COLOR = (0, 255, 0)
+    FP_COLOR = (255, 0, 0)
+
+    for gt_box in gt_boxes:
+        _draw_labeled_box(img, gt_box, GT_COLOR, "GT")
+
+    for i in range(len(boxes)):
+        if scores[i] < conf:
+            continue
+        color = TP_COLOR if is_tp[i] else FP_COLOR
+        text = "{}:{:.1f}%".format("TP" if is_tp[i] else "FP", scores[i] * 100)
+        _draw_labeled_box(img, boxes[i], color, text)
 
     return img
 

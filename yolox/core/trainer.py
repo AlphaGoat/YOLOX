@@ -2,7 +2,9 @@
 # Copyright (c) Megvii, Inc. and its affiliates.
 
 import datetime
+import math
 import os
+import signal
 import time
 from loguru import logger
 
@@ -13,8 +15,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from yolox.data import DataPrefetcher
 from yolox.evaluators.pr_metrics import (
+    best_f1_over_thresholds,
     compute_pr_curve,
+    f1_at_threshold,
     log_pr_curve_to_tensorboard,
+    match_predictions,
     precision_recall_at_threshold,
 )
 from yolox.exp import Exp
@@ -38,7 +43,7 @@ from yolox.utils import (
     setup_logger,
     stretch_for_display,
     synchronize,
-    vis,
+    vis_tp_fp,
 )
 
 
@@ -63,7 +68,16 @@ class Trainer:
         # data/dataloader related attr
         self.data_type = torch.float16 if args.fp16 else torch.float32
         self.input_size = exp.input_size
-        self.best_ap = 0
+        # Best-checkpoint selection metric. Single-class F1, maximized over
+        # every confidence threshold each eval (not COCO AP50:95, and not
+        # F1 at a single fixed threshold like exp.test_conf) -- with one
+        # class and sparse, mostly one-object-per-image ground truth, an
+        # IoU/confidence-averaged metric like AP is a weaker proxy for "is
+        # this checkpoint good" than F1, and scanning all thresholds avoids
+        # the choice depending on exp.test_conf possibly not being the best
+        # operating point for a given epoch's model. See
+        # yolox/evaluators/pr_metrics.py::best_f1_over_thresholds.
+        self.best_metric = 0.0
 
         # metric record
         self.meter = MeterBuffer(window_size=exp.print_interval)
@@ -79,6 +93,41 @@ class Trainer:
             mode="a",
         )
 
+        # Graceful-shutdown support: SIGTERM/SIGINT set a flag instead of
+        # acting directly (Python defers the actual handler body to a safe
+        # point between bytecode instructions in the main thread, so normal
+        # code -- including this logger call -- is fine here, unlike a raw
+        # C signal handler). The flag is polled between iterations in
+        # `train_in_iter`, never from inside the handler, so a signal can
+        # never land mid-`torch.save()` in `save_ckpt` and corrupt
+        # `latest_ckpt.pth`. Only catches SIGTERM/SIGINT -- SIGKILL
+        # (`kill -9`) cannot be intercepted by any process, so reclaiming
+        # the GPU that way still risks losing up to the last completed
+        # iteration's checkpoint.
+        self._stop_requested = False
+        signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        signal.signal(signal.SIGINT, self._handle_stop_signal)
+
+    def _handle_stop_signal(self, signum, frame):
+        if self._stop_requested:
+            # Second signal: the first request didn't stop training fast
+            # enough for whoever's asking. Restore default handling and
+            # re-raise so this one actually kills the process instead of
+            # being silently absorbed again.
+            logger.warning(
+                "second interrupt (signal {}) received, forcing immediate exit "
+                "-- the checkpoint from the graceful stop attempt may be stale "
+                "or missing".format(signum)
+            )
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        logger.warning(
+            "received signal {}, will finish the current iteration, save a "
+            "checkpoint, and stop".format(signum)
+        )
+        self._stop_requested = True
+
     def train(self):
         self.before_train()
         try:
@@ -93,6 +142,19 @@ class Trainer:
         for self.epoch in range(self.start_epoch, self.max_epoch):
             self.before_epoch()
             self.train_in_iter()
+            if self._stop_requested:
+                # Skip the normal after_epoch (which would also trigger a
+                # full eval pass -- slow, and beside the point when the
+                # goal is to free the GPU quickly). start_epoch in the
+                # saved checkpoint becomes self.epoch + 1 either way (see
+                # save_ckpt), so resuming redoes at most the remainder of
+                # this epoch's worth of iterations, never more.
+                logger.warning(
+                    "stop requested, saving checkpoint at epoch {} and "
+                    "ending training early".format(self.epoch + 1)
+                )
+                self.save_ckpt(ckpt_name="latest")
+                break
             self.after_epoch()
 
     def train_in_iter(self):
@@ -100,6 +162,8 @@ class Trainer:
             self.before_iter()
             self.train_one_iter()
             self.after_iter()
+            if self._stop_requested:
+                break
 
     def train_one_iter(self):
         iter_start_time = time.time()
@@ -205,9 +269,15 @@ class Trainer:
         logger.info("\n{}".format(model))
 
     def after_train(self):
-        logger.info(
-            "Training of experiment is done and the best AP is {:.2f}".format(self.best_ap * 100)
-        )
+        if self._stop_requested:
+            logger.info(
+                "Training stopped early by signal after epoch {}; best F1 so far "
+                "is {:.4f}. Resume with --resume.".format(self.epoch + 1, self.best_metric)
+            )
+        else:
+            logger.info(
+                "Training of experiment is done and the best F1 is {:.4f}".format(self.best_metric)
+            )
         if self.rank == 0:
             if self.args.logger == "wandb":
                 self.wandb_logger.finish()
@@ -217,7 +287,7 @@ class Trainer:
                     "input_size": self.input_size,
                     'start_ckpt': self.args.ckpt,
                     'exp_file': self.args.exp_file,
-                    "best_ap": float(self.best_ap)
+                    "best_f1": float(self.best_metric)
                 }
                 self.mlflow_logger.on_train_end(self.args, file_name=self.file_name,
                                                 metadata=metadata)
@@ -351,14 +421,44 @@ class Trainer:
 
             if weight_vals:
                 w = torch.cat(weight_vals)
-                self.tblogger.add_scalar("train/weights/mean", w.mean().item(), self.progress_in_iter)
-                self.tblogger.add_scalar("train/weights/std", w.std().item(), self.progress_in_iter)
+                w_mean, w_std = w.mean().item(), w.std().item()
+                if math.isfinite(w_mean) and math.isfinite(w_std):
+                    self.tblogger.add_scalar("train/weights/mean", w_mean, self.progress_in_iter)
+                    self.tblogger.add_scalar("train/weights/std", w_std, self.progress_in_iter)
+                else:
+                    logger.warning(
+                        "train/weights/mean or /std is non-finite at iter {}, skipping "
+                        "-- model weights have diverged".format(self.progress_in_iter)
+                    )
 
             if grad_vals:
                 g = torch.cat(grad_vals)
-                self.tblogger.add_scalar("train/grad/mean", g.mean().item(), self.progress_in_iter)
-                self.tblogger.add_scalar("train/grad/std", g.std().item(), self.progress_in_iter)
-                self.tblogger.add_scalar("train/grad/norm", grad_sq_sum ** 0.5, self.progress_in_iter)
+                g_mean, g_std, g_norm = g.mean().item(), g.std().item(), grad_sq_sum ** 0.5
+                if math.isfinite(g_mean) and math.isfinite(g_std) and math.isfinite(g_norm):
+                    self.tblogger.add_scalar("train/grad/mean", g_mean, self.progress_in_iter)
+                    self.tblogger.add_scalar("train/grad/std", g_std, self.progress_in_iter)
+                    self.tblogger.add_scalar("train/grad/norm", g_norm, self.progress_in_iter)
+                else:
+                    # Unlike a non-finite weight, a non-finite pooled
+                    # gradient here is expected and benign on this sparse,
+                    # one-object-per-image dataset with small batches:
+                    # SimOTA's dynamic label assignment can assign zero
+                    # foreground anchors for a batch, producing a NaN
+                    # gradient for some parameters without destabilizing
+                    # training (AMP's GradScaler detects the same condition
+                    # and skips that optimizer step entirely -- confirmed
+                    # via a real smoke-test run, 2026-09-19). Plain tensor
+                    # .mean()/.std() don't raise on NaN/Inf input -- they
+                    # silently return NaN/Inf -- so this can't rely on the
+                    # try/except below, which only catches actual
+                    # exceptions and would never fire for this; the values
+                    # are checked explicitly instead and skipped (not
+                    # logged as NaN) so the TensorBoard chart doesn't get a
+                    # literal NaN point breaking the line.
+                    logger.warning(
+                        "train/grad/* is non-finite at iter {}, skipping this point "
+                        "(likely a zero-foreground-anchor batch, not a crash)".format(self.progress_in_iter)
+                    )
         except Exception:
             # Metrics logging must never take down an actual training run --
             # and NaN/Inf parameters or gradients (exactly the instability
@@ -383,7 +483,7 @@ class Trainer:
             # resume the model/optimizer state dict
             model.load_state_dict(ckpt["model"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
-            self.best_ap = ckpt.pop("best_ap", 0)
+            self.best_metric = ckpt.pop("best_metric", 0.0)
             # resume the training states variables
             start_epoch = (
                 self.args.start_epoch - 1
@@ -419,20 +519,45 @@ class Trainer:
                 evalmodel, self.evaluator, self.is_distributed, return_outputs=True
             )
 
-        update_best_ckpt = ap50_95 > self.best_ap
-        self.best_ap = max(self.best_ap, ap50_95)
+        # Best-checkpoint selection uses single-class F1 maximized over
+        # every confidence threshold (an oracle/best-achievable metric),
+        # not COCO AP50:95 and not F1 at a single fixed threshold -- see
+        # Trainer.__init__ for why. Computed once here and passed to
+        # log_precision_recall below rather than recomputed there, since
+        # compute_pr_curve walks every validation prediction.
+        #
+        # F1 at exp.test_conf is also still computed and logged (val/f1) as
+        # a separate, more conservative diagnostic: "what F1 do I actually
+        # get at the threshold I'll deploy with", vs. val/f1_best's "what's
+        # the best F1 any threshold could get this checkpoint" (which is
+        # what drives best_ckpt.pth). The two will diverge whenever
+        # exp.test_conf isn't this epoch's actual optimum.
+        coco_gt = self.evaluator.dataloader.dataset.coco
+        pr_curve = compute_pr_curve(predictions, coco_gt, iou_thresh=0.5)
+        f1_at_test_conf = f1_at_threshold(pr_curve, self.exp.test_conf)
+        f1_best, f1_best_thresh = best_f1_over_thresholds(pr_curve)
+
+        update_best_ckpt = f1_best > self.best_metric
+        self.best_metric = max(self.best_metric, f1_best)
 
         if self.rank == 0:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.tblogger.add_scalar("val/f1", f1_at_test_conf, self.epoch + 1)
+                self.tblogger.add_scalar("val/f1_best", f1_best, self.epoch + 1)
+                if not np.isnan(f1_best_thresh):
+                    self.tblogger.add_scalar("val/f1_best_threshold", f1_best_thresh, self.epoch + 1)
                 self.log_prediction_images(predictions)
-                self.log_precision_recall(predictions)
+                self.log_precision_recall(pr_curve)
                 self.log_weight_histograms()
             if self.args.logger == "wandb":
                 self.wandb_logger.log_metrics({
                     "val/COCOAP50": ap50,
                     "val/COCOAP50_95": ap50_95,
+                    "val/f1": f1_at_test_conf,
+                    "val/f1_best": f1_best,
+                    "val/f1_best_threshold": f1_best_thresh,
                     "train/epoch": self.epoch + 1,
                 })
                 self.wandb_logger.log_images(predictions)
@@ -440,16 +565,23 @@ class Trainer:
                 logs = {
                     "val/COCOAP50": ap50,
                     "val/COCOAP50_95": ap50_95,
-                    "val/best_ap": round(self.best_ap, 3),
+                    "val/f1": f1_at_test_conf,
+                    "val/f1_best": f1_best,
+                    "val/f1_best_threshold": f1_best_thresh,
+                    "val/best_f1": round(self.best_metric, 3),
                     "train/epoch": self.epoch + 1,
                 }
                 self.mlflow_logger.on_log(self.args, self.exp, self.epoch+1, logs)
             logger.info("\n" + summary)
         synchronize()
 
-        self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95)
+        self.save_ckpt(
+            "last_epoch", update_best_ckpt, ap=ap50_95, f1=f1_best, f1_threshold=f1_best_thresh
+        )
         if self.save_history_ckpt:
-            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=ap50_95)
+            self.save_ckpt(
+                f"epoch_{self.epoch + 1}", ap=ap50_95, f1=f1_best, f1_threshold=f1_best_thresh
+            )
 
         if self.args.logger == "mlflow":
             metadata = {
@@ -457,26 +589,36 @@ class Trainer:
                     "input_size": self.input_size,
                     'start_ckpt': self.args.ckpt,
                     'exp_file': self.args.exp_file,
-                    "best_ap": float(self.best_ap)
+                    "best_f1": float(self.best_metric)
                 }
             self.mlflow_logger.save_checkpoints(self.args, self.exp, self.file_name, self.epoch,
                                                 metadata, update_best_ckpt)
 
     def log_prediction_images(self, predictions, max_images=8):
-        """Logs a handful of validation images with predicted boxes drawn in
-        to TensorBoard, for visual sanity-checking during training.
+        """Logs a handful of validation images with ground-truth boxes plus
+        predicted boxes (labeled TP or FP) drawn in, to TensorBoard, for
+        visual sanity-checking during training.
 
         TensorBoard has no declarative box-overlay format (unlike wandb's
         `wandb.Image(img, boxes=...)`, used elsewhere in this file), so
-        boxes are drawn directly into the pixel data via `vis()`.
+        boxes are drawn directly into the pixel data via `vis_tp_fp()`.
+        TP/FP status comes from the same greedy IoU matching
+        (`match_predictions`, iou_thresh=0.5) that drives the PR curve, F1,
+        and best-checkpoint selection elsewhere in this file -- so a box
+        labeled TP/FP here is exactly what those metrics counted it as, not
+        a separately-eyeballed judgment call. A ground-truth box with no
+        nearby TP-colored box is a visible miss (false negative), without
+        needing a separate label for that case.
 
-        `predictions` values are in *original* (pre-resize) image pixel
-        space (see COCOEvaluator.convert_to_coco_format: `bboxes /= scale`
-        undoes the resize before storing), so boxes are re-scaled by the
-        same `min(test_size / orig_size)` factor the evaluator used before
-        being drawn onto the resized-but-unpadded image `pull_item` returns
-        -- drawing unscaled original-space boxes onto a resized image would
-        misalign them.
+        `predictions` values and ground-truth boxes are both in *original*
+        (pre-resize) image pixel space (see COCOEvaluator.convert_to_coco_
+        format for predictions: `bboxes /= scale` undoes the resize before
+        storing; ground truth comes straight from the COCO json built by
+        convert_to_coco.py against full sensor width/height), so both are
+        re-scaled by the same `min(test_size / orig_size)` factor the
+        evaluator used before being drawn onto the resized-but-unpadded
+        image `pull_item` returns -- drawing unscaled original-space boxes
+        onto a resized image would misalign them.
 
         Images are decoded from 16-bit FITS and kept as normalized float32
         for training precision (see yolox/data/datasets/coco.py); real
@@ -486,8 +628,11 @@ class Trainer:
         look almost entirely black.
         """
         dataset = self.evaluator.dataloader.dataset
+        coco_gt = dataset.coco
         test_size = self.exp.test_size
-        class_names = dataset._classes
+        # Single-class assumption already made throughout this file (see
+        # compute_pr_curve's default class_id) -- the only category present.
+        class_id = coco_gt.getCatIds()[0]
 
         ids = dataset.ids[:max_images]
         if not ids:
@@ -496,28 +641,33 @@ class Trainer:
         for img_id in ids:
             index = dataset.ids.index(img_id)
             img, _, (orig_h, orig_w), _ = dataset.pull_item(index)
+            scale = min(test_size[0] / orig_h, test_size[1] / orig_w)
+
+            ann_ids = coco_gt.getAnnIds(imgIds=[int(img_id)], catIds=[class_id], iscrowd=False)
+            gt_anns = coco_gt.loadAnns(ann_ids)
+            gt_boxes = np.array(
+                [[a["bbox"][0], a["bbox"][1],
+                  a["bbox"][0] + a["bbox"][2], a["bbox"][1] + a["bbox"][3]]
+                 for a in gt_anns],
+                dtype=np.float32,
+            ).reshape(-1, 4) * scale
 
             pred = predictions.get(
                 int(img_id), {"bboxes": [], "scores": [], "categories": []}
             )
-            scale = min(test_size[0] / orig_h, test_size[1] / orig_w)
-            boxes = np.array(pred["bboxes"], dtype=np.float32).reshape(-1, 4) * scale
-            scores = np.array(pred["scores"], dtype=np.float32)
-            # vis() indexes _classes/_COLORS by the model's internal
-            # contiguous class index, but predictions store the original
-            # COCO category_id (see convert_to_coco_format) -- map back.
-            cls_ids = np.array(
-                [dataset.class_ids.index(c) for c in pred["categories"]], dtype=np.int64
-            )
+            keep = np.array(pred["categories"]) == class_id
+            boxes = np.array(pred["bboxes"], dtype=np.float32).reshape(-1, 4)[keep] * scale
+            scores = np.array(pred["scores"], dtype=np.float32)[keep]
+            is_tp = match_predictions(boxes, scores, gt_boxes, iou_thresh=0.5)
 
             disp = stretch_for_display(img)
-            disp = vis(disp.copy(), boxes, scores, cls_ids, conf=0.3, class_names=class_names)
+            disp = vis_tp_fp(disp.copy(), boxes, scores, is_tp, gt_boxes, conf=0.3)
 
             self.tblogger.add_image(
                 f"val/predictions/{img_id}", disp, self.epoch + 1, dataformats="HWC"
             )
 
-    def log_precision_recall(self, predictions):
+    def log_precision_recall(self, pr_curve):
         """Logs single-class precision/recall to TensorBoard, plus a full
         PR curve, every eval.
 
@@ -528,15 +678,17 @@ class Trainer:
         computed directly (greedy IoU matching) rather than read out of
         pycocotools' internal COCOeval state.
 
+        `pr_curve` is precomputed by the caller (evaluate_and_save_model,
+        via compute_pr_curve) since it's also needed there for F1-based
+        best-checkpoint selection -- recomputing it here would walk every
+        validation prediction a second time for no reason.
+
         `val/precision` and `val/recall` are reported at `self.exp.test_conf`
         -- the same confidence threshold actually used to filter detections
         at inference (see COCOEvaluator.evaluate's `postprocess` call), so
         these answer "what precision/recall does the model get as deployed"
         rather than an aggregate across all thresholds.
         """
-        coco_gt = self.evaluator.dataloader.dataset.coco
-        pr_curve = compute_pr_curve(predictions, coco_gt, iou_thresh=0.5)
-
         precision, recall = precision_recall_at_threshold(pr_curve, self.exp.test_conf)
         # precision is NaN when nothing scored >= test_conf yet (common
         # early in training) -- skip the scalar point rather than log a
@@ -597,7 +749,7 @@ class Trainer:
                 # accepted but does not attach a traceback.
                 logger.opt(exception=True).warning(f"log_weight_histograms failed for '{name}', skipping")
 
-    def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
+    def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None, f1=None, f1_threshold=None):
         if self.rank == 0:
             save_model = self.ema_model.ema if self.use_model_ema else self.model
             logger.info("Save weights to {}".format(self.file_name))
@@ -605,8 +757,19 @@ class Trainer:
                 "start_epoch": self.epoch + 1,
                 "model": save_model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
-                "best_ap": self.best_ap,
+                "best_metric": self.best_metric,
                 "curr_ap": ap,
+                # curr_f1 is the best-over-all-thresholds F1 (see
+                # best_f1_over_thresholds) -- the metric that actually
+                # decides update_best_ckpt -- and curr_f1_threshold is the
+                # confidence threshold that achieves it. For best_ckpt.pth
+                # specifically, curr_f1_threshold is a genuinely useful
+                # number: it's the threshold you'd want to set exp.test_conf
+                # to in order to actually realize this checkpoint's best F1
+                # at inference, rather than whatever test_conf happened to
+                # be during training.
+                "curr_f1": f1,
+                "curr_f1_threshold": f1_threshold,
             }
             save_checkpoint(
                 ckpt_state,
@@ -623,7 +786,9 @@ class Trainer:
                     metadata={
                         "epoch": self.epoch + 1,
                         "optimizer": self.optimizer.state_dict(),
-                        "best_ap": self.best_ap,
-                        "curr_ap": ap
+                        "best_metric": self.best_metric,
+                        "curr_ap": ap,
+                        "curr_f1": f1,
+                        "curr_f1_threshold": f1_threshold,
                     }
                 )

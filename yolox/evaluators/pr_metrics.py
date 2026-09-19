@@ -26,6 +26,8 @@ __all__ = [
     "match_predictions",
     "compute_pr_curve",
     "precision_recall_at_threshold",
+    "f1_at_threshold",
+    "best_f1_over_thresholds",
     "log_pr_curve_to_tensorboard",
 ]
 
@@ -195,6 +197,68 @@ def precision_recall_at_threshold(pr_curve, conf_thresh):
     precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
     recall = tp / num_gt
     return float(precision), float(recall)
+
+
+def f1_at_threshold(pr_curve, conf_thresh):
+    """Single-class F1 score at a fixed confidence threshold, from a curve
+    returned by `compute_pr_curve`.
+
+    Built on `precision_recall_at_threshold` -- see that function for why
+    `conf_thresh` should normally be `exp.test_conf`, the same threshold
+    used to filter detections at inference. Returns `0.0` (not NaN) when
+    nothing scores >= `conf_thresh`: `precision_recall_at_threshold` always
+    pairs a NaN precision with recall == 0.0 in that case (no prediction
+    means no true positive, so `tp + fp` for the "how many predictions
+    kept" denominator is 0 too), and 0 recall means the model detects
+    nothing at this threshold regardless of precision being undefined --
+    worse than any real detector, not "unknown". This makes F1 safe to use
+    directly as a best-checkpoint comparison key without a separate NaN
+    check at every call site.
+    """
+    precision, recall = precision_recall_at_threshold(pr_curve, conf_thresh)
+    if recall == 0.0 or np.isnan(precision):
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def best_f1_over_thresholds(pr_curve):
+    """Best F1 achievable at any confidence threshold, and the threshold
+    that achieves it, from a curve returned by `compute_pr_curve`.
+
+    Unlike `f1_at_threshold` (one fixed threshold, e.g. `exp.test_conf` --
+    "what do I get as actually deployed"), this scans every threshold the
+    curve has a point for: `compute_pr_curve` already returns cumulative
+    precision/recall at each successive prediction's score (i.e. "keep the
+    top-k highest-confidence predictions", for every k), so the best F1
+    over all thresholds is just the max of the per-point F1 values, and its
+    threshold is that point's score. This is an oracle metric -- the best a
+    post-hoc-tuned threshold could do on this validation set -- useful for
+    comparing model/checkpoint quality independent of whatever
+    `exp.test_conf` happens to be set to, at the cost of being optimistic
+    versus real deployment (where the threshold is fixed in advance, not
+    re-picked per checkpoint).
+
+    Unlike `precision_recall_at_threshold`, precision is never NaN at any
+    in-range curve point: index i always corresponds to keeping exactly
+    i + 1 predictions (the top i + 1 by score), so `num_tp + num_fp` at
+    that point is always >= 1.
+
+    Returns:
+        `(best_f1, best_threshold)`. `best_threshold` is `float('nan')`
+        when the curve is empty (no predictions or no ground truth), and
+        `best_f1` is `0.0` in that case.
+    """
+    scores = pr_curve["scores"]
+    if len(scores) == 0:
+        return 0.0, float("nan")
+
+    precision = pr_curve["precision"]
+    recall = pr_curve["recall"]
+    denom = precision + recall
+    f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
+
+    best_idx = int(np.argmax(f1))
+    return float(f1[best_idx]), float(scores[best_idx])
 
 
 def log_pr_curve_to_tensorboard(tblogger, pr_curve, global_step, tag="val/pr_curve", num_thresholds=127):
